@@ -322,7 +322,7 @@ def encode_audio(path, sr, audio, bitexact=False, timeout=60.0):
     """
     with tempfile.NamedTemporaryFile(suffix=".wav") as f:
         wavwrite(f.name, sr, audio)
-        cmd = f"ffmpeg -v error -i {f.name} -y {'-bitexact' if bitexact else ''} {path}"
+        cmd = f'ffmpeg -v error -i "{f.name}" -y {"-bitexact" if bitexact else ""} "{path}"'
         status, stdout, stderr = run_cmd_sync(cmd, timeout=timeout)
         if status != 0:
             raise Exception(f"FFmpeg failed: {stderr}")
@@ -332,7 +332,7 @@ def encode_audio(path, sr, audio, bitexact=False, timeout=60.0):
 def get_approximate_audio_length(path, timeout=10):
     """Retrieves the approximate length of an audio file."""
     status, stdout, stderr = run_cmd_sync(
-        f"ffprobe -v error -i {path} -show_format -show_streams -print_format json",
+        f'ffprobe -v error -i "{path}" -show_format -show_streams -print_format json',
         timeout=timeout,
     )
     try:
