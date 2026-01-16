@@ -1,5 +1,6 @@
 import json
 import logging
+import os
 import pathlib
 import tempfile
 from enum import Enum
@@ -398,7 +399,13 @@ def _split_into_chunks_dynamicly(
             measure_end_tertiary = len(tertiaries_times)
         # if not measure_start_tertiary < measure_end_tertiary:
         #     continue
-        assert measure_end_tertiary <= tertiaries_times.shape[0]
+        # 调试信息
+        if measure_end_tertiary > tertiaries_times.shape[0]:
+            import logging
+            logging.error(f"DEBUG: i={i}, downbeats[i]={downbeats[i]}, len(downbeats)={len(downbeats)}")
+            logging.error(f"DEBUG: measure_end_tertiary={measure_end_tertiary}, tertiaries_times.shape[0]={tertiaries_times.shape[0]}")
+            logging.error(f"DEBUG: downbeats={downbeats}")
+        assert measure_end_tertiary <= tertiaries_times.shape[0], f"measure_end_tertiary={measure_end_tertiary} > tertiaries_times.shape[0]={tertiaries_times.shape[0]}"
         measure_slice = slice(measure_start_tertiary, measure_end_tertiary)
 
         measure_tertiaries_times = tertiaries_times[measure_slice]
@@ -450,12 +457,15 @@ def _extract_features(
 
     extractor = _init_extractor(input_feats)
     chunks_features = []
-    with tempfile.NamedTemporaryFile("wb") as f:
+    # Windows: NamedTemporaryFile locks file, use delete=False and close first
+    tmp_file = tempfile.NamedTemporaryFile("wb", delete=False)
+    try:
         if isinstance(audio_path_or_bytes, bytes):
-            f.write(audio_path_or_bytes)
-            f.flush()
-            audio_path = f.name
+            tmp_file.write(audio_path_or_bytes)
+            tmp_file.close()
+            audio_path = tmp_file.name
         else:
+            tmp_file.close()
             audio_path = str(audio_path_or_bytes)
 
         for chunk_slice in tqdm(chunks_tertiaries):
@@ -472,6 +482,13 @@ def _extract_features(
                 beat_resampled.append(np.mean(feats[s:e], axis=0, keepdims=True))
             beat_resampled = np.concatenate(beat_resampled, axis=0)
             chunks_features.append(beat_resampled)
+    finally:
+        # Clean up temp file
+        if isinstance(audio_path_or_bytes, bytes):
+            try:
+                os.unlink(tmp_file.name)
+            except Exception:
+                pass
 
     # Normalize handcrafted features (after beat resampling)
     # NOTE: Normalizing after beat resampling is probably a bug in retrospect, but it's
@@ -735,14 +752,8 @@ def sheetsage(
     Callable[float, float]
        Metronome function for converting beat values to timestamps
     """
-    # Check mpi4py is installed manually
-    try:
-        from mpi4py import MPI
-    except ModuleNotFoundError:
-        raise ModuleNotFoundError(
-            "Please install mpi4py to use SheetSage. "
-            "You can install it via 'conda install mpi4py'."
-        )
+    # mpi4py 只在使用 Jukebox 时需要，移除强制检查
+    # 如果需要 Jukebox，会在加载时自动报错
 
     if return_intermediaries:
         logging.warning(
@@ -812,8 +823,7 @@ def sheetsage(
         segment_start_downbeat = None
         segment_end_beat = None
     else:
-        # TODO: Implement original beat detection
-        raise NotImplementedError("We haven't implemented this yet.")
+        # 使用 madmom 进行节拍检测
         # Run beat detection
         status_change_callback(Status.DETECTING_BEATS)
         (
@@ -834,6 +844,19 @@ def sheetsage(
             beat_detection_padding,
             legacy_behavior,
         )
+        # 从节拍检测结果计算 downbeats（拍子索引，不是时间戳）
+        # legacy_behavior 模式下，beats 已经从 segment_start_downbeat 开始截断了
+        # 所以 downbeats 在新列表中从 0 开始，间隔为 beats_per_measure
+        # 注意：tertiaries_times 可能被进一步截断，downbeats 不能超出其范围
+        max_beat_idx = len(tertiaries_times) // _TERTIARIES_PER_BEAT
+        if legacy_behavior:
+            downbeats = [i for i in range(0, len(beats), beats_per_measure) if i < max_beat_idx]
+        else:
+            downbeats = [
+                i for i in range(len(beats))
+                if i % beats_per_measure == segment_start_downbeat % beats_per_measure
+                and i < max_beat_idx
+            ]
 
     # Identify suitable chunks for running through transcription model
     if dynamic_chunking:
@@ -875,32 +898,30 @@ def sheetsage(
     ) = _transcribe_chunks(chunks_features, input_feats, detect_melody, detect_harmony)
 
     # Create lead sheet
-    if dynamic_chunking:
-        logging.warning(
-            "Format lead sheet for dynamic chunking is not implemented currently."
-        )
-        lead_sheet = None
-        segment_beats = None
-        segment_beats_times = None
-        beats_per_measure = downbeats[1] - downbeats[0]  # TODO: It's just a workaround
-        segment_start_downbeat = downbeats[0]
-        segment_end_beat = downbeats[-1]
-    else:
-        # TODO: Implement original behavior for dynamic chunking
-        status_change_callback(Status.FORMATTING)
-        total_num_tertiary = sum([c.shape[0] for c in chunks_features])
-        lead_sheet, segment_beats, segment_beats_times = _format_lead_sheet(
-            melody_logits,
-            harmony_logits,
-            beats_per_measure,
-            beats,
-            beats_times,
-            segment_start_downbeat,
-            segment_end_beat,
-            total_num_tertiary,
-            melody_threshold=melody_threshold,
-            harmony_threshold=harmony_threshold,
-        )
+    status_change_callback(Status.FORMATTING)
+    total_num_tertiary = sum([c.shape[0] for c in chunks_features])
+
+    # 对于 dynamic_chunking 模式，使用已有的节拍信息
+    # 如果 segment_start_downbeat 或 segment_end_beat 为 None，从 downbeats 推导
+    if segment_start_downbeat is None:
+        segment_start_downbeat = downbeats[0] if downbeats else 0
+    if segment_end_beat is None:
+        segment_end_beat = downbeats[-1] if downbeats else len(beats) - 1
+    if beats_per_measure is None:
+        beats_per_measure = downbeats[1] - downbeats[0] if len(downbeats) > 1 else 4
+
+    lead_sheet, segment_beats, segment_beats_times = _format_lead_sheet(
+        melody_logits,
+        harmony_logits,
+        beats_per_measure,
+        beats,
+        beats_times,
+        segment_start_downbeat,
+        segment_end_beat,
+        total_num_tertiary,
+        melody_threshold=melody_threshold,
+        harmony_threshold=harmony_threshold,
+    )
 
     status_change_callback(Status.DONE)
 

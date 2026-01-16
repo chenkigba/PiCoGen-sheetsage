@@ -1,6 +1,7 @@
 import gzip
 import hashlib
 import json
+import os
 import pathlib
 import shlex
 import subprocess
@@ -255,13 +256,16 @@ def decode_audio(
     :class:`RuntimeError`
        Unknown file format.
     """
-    with tempfile.NamedTemporaryFile("wb") as f:
+    # Windows: NamedTemporaryFile locks file, use delete=False and close first
+    tmp_file = tempfile.NamedTemporaryFile("wb", delete=False)
+    try:
         # NOTE: This could be BytesIO but librosa has buggy support.
         if isinstance(path_or_bytes, bytes):
-            f.write(path_or_bytes)
-            f.flush()
-            path = f.name
+            tmp_file.write(path_or_bytes)
+            tmp_file.close()
+            path = tmp_file.name
         else:
+            tmp_file.close()
             path = path_or_bytes
 
         # Decode audio file
@@ -278,6 +282,13 @@ def decode_audio(
                 )
         except audioread.exceptions.NoBackendError as e:
             raise RuntimeError("Unknown audio format") from e
+    finally:
+        # Clean up temp file
+        if isinstance(path_or_bytes, bytes):
+            try:
+                os.unlink(tmp_file.name)
+            except Exception:
+                pass
 
     # Check output and rearrange to [nsamps, nch]
     assert isinstance(sr, int)
@@ -320,13 +331,21 @@ def encode_audio(path, sr, audio, bitexact=False, timeout=60.0):
     :class:`Exception`
        FFmpeg threw an error while encoding.
     """
-    with tempfile.NamedTemporaryFile(suffix=".wav") as f:
-        wavwrite(f.name, sr, audio)
-        cmd = f'ffmpeg -v error -i "{f.name}" -y {"-bitexact" if bitexact else ""} "{path}"'
+    # Windows: NamedTemporaryFile locks file, use delete=False and close first
+    tmp_file = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
+    try:
+        tmp_file.close()
+        wavwrite(tmp_file.name, sr, audio)
+        cmd = f'ffmpeg -v error -i "{tmp_file.name}" -y {"-bitexact" if bitexact else ""} "{path}"'
         status, stdout, stderr = run_cmd_sync(cmd, timeout=timeout)
         if status != 0:
             raise Exception(f"FFmpeg failed: {stderr}")
         assert pathlib.Path(path).is_file()
+    finally:
+        try:
+            os.unlink(tmp_file.name)
+        except Exception:
+            pass
 
 
 def get_approximate_audio_length(path, timeout=10):
